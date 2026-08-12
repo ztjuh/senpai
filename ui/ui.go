@@ -12,10 +12,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"git.sr.ht/~rockorager/vaxis"
-	"git.sr.ht/~rockorager/vaxis/widgets/align"
-	"github.com/containerd/console"
 	"github.com/disintegration/imaging"
+	"go.rockorager.dev/vaxis"
+	"go.rockorager.dev/vaxis/widgets/align"
 
 	"git.sr.ht/~delthas/senpai/events"
 	"git.sr.ht/~delthas/senpai/irc"
@@ -33,7 +32,7 @@ type Config struct {
 	MergeLine         func(former *Line, addition Line)
 	Colors            ConfigColors
 	LocalIntegrations bool
-	WithConsole       console.Console
+	WithConsole       vaxis.Console
 	WithTTY           string
 }
 
@@ -224,7 +223,7 @@ func New(config Config) (ui *UI, colors ConfigColors, err error) {
 
 	ui.bs = NewBufferList(ui)
 	ui.e = NewEditor(ui)
-	ui.Resize()
+	ui.Relayout()
 
 	return ui, ui.config.Colors, nil
 }
@@ -296,7 +295,7 @@ func (ui *UI) ResizeChannelCol(x int) {
 		return
 	}
 	ui.channelWidth = x
-	ui.Resize()
+	ui.Relayout()
 }
 
 func (ui *UI) ClickMemberCol(v bool) {
@@ -317,7 +316,7 @@ func (ui *UI) ResizeMemberCol(x int) {
 		return
 	}
 	ui.memberWidth = x
-	ui.Resize()
+	ui.Relayout()
 }
 
 func (ui *UI) GoToBufferNo(i int) {
@@ -423,7 +422,7 @@ func (ui *UI) ToggleChannelList() {
 	} else {
 		ui.channelWidth = 0
 	}
-	ui.Resize()
+	ui.Relayout()
 }
 
 func (ui *UI) ToggleMemberList() {
@@ -432,7 +431,7 @@ func (ui *UI) ToggleMemberList() {
 	} else {
 		ui.memberWidth = 0
 	}
-	ui.Resize()
+	ui.Relayout()
 }
 
 func (ui *UI) ScrollMemberUpBy(n int) {
@@ -712,12 +711,14 @@ func (ui *UI) InputBackSearch() {
 	ui.e.BackSearch()
 }
 
-func (ui *UI) SetWinPixels(xPixel int, yPixel int) {
-	ui.vx.xPixel = xPixel
-	ui.vx.yPixel = yPixel
+func (ui *UI) Resize(size vaxis.Resize) {
+	ui.vx.Resize(size)
+	ui.vx.xPixel = size.XPixel
+	ui.vx.yPixel = size.YPixel
+	ui.Relayout()
 }
 
-func (ui *UI) Resize() {
+func (ui *UI) Relayout() {
 	ui.vx.window = ui.vx.Window() // Refresh window size
 	w, h := ui.vx.window.Size()
 	innerWidth := w - 9 - ui.channelWidth - ui.config.NickColWidth - ui.memberWidth

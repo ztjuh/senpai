@@ -1,6 +1,6 @@
 package ui
 
-import "git.sr.ht/~rockorager/vaxis"
+import "go.rockorager.dev/vaxis"
 
 var KeyNames = map[string]rune{
 	"Up":                   vaxis.KeyUp,

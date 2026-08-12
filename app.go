@@ -28,7 +28,7 @@ import (
 	"unicode/utf8"
 
 	"git.sr.ht/~delthas/senpai/varlinkservice"
-	"git.sr.ht/~rockorager/vaxis"
+	"go.rockorager.dev/vaxis"
 	"golang.org/x/net/proxy"
 
 	"git.sr.ht/~delthas/senpai/events"
@@ -607,8 +607,7 @@ func (app *App) handleUIEvent(ev interface{}) bool {
 	// TODO: eat QuitEvent here?
 	switch ev := ev.(type) {
 	case vaxis.Resize:
-		app.win.SetWinPixels(ev.XPixel, ev.YPixel)
-		app.win.Resize()
+		app.win.Resize(ev)
 	case vaxis.PasteStartEvent:
 		app.pasting = true
 		app.pastingInputOnly = len(app.win.InputContent()) == 0
@@ -945,7 +944,7 @@ func (app *App) handleAction(action string, args ...string) {
 	case "cursor-end":
 		app.win.InputEnd()
 	case "redraw":
-		app.win.Resize()
+		app.win.Relayout()
 	case "scroll-up":
 		app.win.ScrollUp()
 	case "scroll-down":

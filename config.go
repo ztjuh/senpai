@@ -9,8 +9,7 @@ import (
 	"strconv"
 	"strings"
 
-	"git.sr.ht/~rockorager/vaxis"
-	"github.com/containerd/console"
+	"go.rockorager.dev/vaxis"
 
 	"git.sr.ht/~delthas/senpai/ui"
 
@@ -122,7 +121,7 @@ type Config struct {
 	LocalIntegrations bool
 
 	WithTTY     string
-	WithConsole console.Console
+	WithConsole vaxis.Console
 }
 
 func DefaultHighlightPath() (string, error) {

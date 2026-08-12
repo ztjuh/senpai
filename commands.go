@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"git.sr.ht/~rockorager/vaxis"
+	"go.rockorager.dev/vaxis"
 	"github.com/delthas/go-libnp"
 
 	"git.sr.ht/~delthas/senpai/irc"

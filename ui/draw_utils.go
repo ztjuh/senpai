@@ -6,9 +6,9 @@ import (
 	"sync"
 	"time"
 
-	"git.sr.ht/~rockorager/vaxis"
 	"github.com/delthas/go-localeinfo"
-	"github.com/rivo/uniseg"
+	uucode "github.com/rockorager/go-uucode"
+	"go.rockorager.dev/vaxis"
 )
 
 var asciiStringCache []string
@@ -98,7 +98,13 @@ func firstCluster(vx *Vaxis, r []rune) (c string, width int) {
 	if r[0] <= 0x7F { // ASCII fast-path
 		return asciiStringCache[int(r[0])], runeWidth(vx, r[0])
 	}
-	c, _, _, _ = uniseg.FirstGraphemeClusterInString(string(r), -1)
+	s := string(r)
+	it := uucode.NewGraphemeIterator(s)
+	g, ok := it.Next()
+	if !ok {
+		return "", 0
+	}
+	c = s[g.Start:g.End]
 
 	var cw int
 	if n, ok := clusterWidthMap[c]; ok {

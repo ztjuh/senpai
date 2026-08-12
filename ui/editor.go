@@ -4,7 +4,7 @@ import (
 	"strings"
 
 	"git.sr.ht/~delthas/senpai/events"
-	"git.sr.ht/~rockorager/vaxis"
+	"go.rockorager.dev/vaxis"
 )
 
 type Completion struct {

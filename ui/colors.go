@@ -4,7 +4,7 @@ import (
 	"hash/fnv"
 	"math"
 
-	"git.sr.ht/~rockorager/vaxis"
+	"go.rockorager.dev/vaxis"
 )
 
 var ColorDefault = vaxis.Color(0)

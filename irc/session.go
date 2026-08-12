@@ -11,7 +11,7 @@ import (
 	"time"
 	"unicode"
 
-	"git.sr.ht/~rockorager/vaxis"
+	"go.rockorager.dev/vaxis"
 	"golang.org/x/time/rate"
 )
 

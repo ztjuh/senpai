@@ -2,6 +2,7 @@ package ui
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"image"
 	"io"
@@ -156,7 +157,10 @@ func New(config Config) (ui *UI, colors ConfigColors, err error) {
 		window: vx.Window(),
 	}
 
-	bg := ui.vx.QueryBackground().Params()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	bg := ui.vx.QueryBackgroundContext(ctx).Params()
 	if len(bg) == 3 {
 		if (int(bg[0])+int(bg[1])+int(bg[2]))/3 > 127 {
 			ui.colorThemeMode = vaxis.LightMode
@@ -168,10 +172,10 @@ func New(config Config) (ui *UI, colors ConfigColors, err error) {
 	}
 
 	ui.config.Colors.Gray = vaxis.IndexColor(8)
-	black := ui.vx.QueryColor(vaxis.IndexColor(uint8(0))).Params()
-	gray := ui.vx.QueryColor(vaxis.IndexColor(uint8(8))).Params()
-	white := ui.vx.QueryColor(vaxis.IndexColor(uint8(15))).Params()
-	fg := ui.vx.QueryForeground().Params()
+	black := ui.vx.QueryColorContext(ctx, vaxis.IndexColor(uint8(0))).Params()
+	gray := ui.vx.QueryColorContext(ctx, vaxis.IndexColor(uint8(8))).Params()
+	white := ui.vx.QueryColorContext(ctx, vaxis.IndexColor(uint8(15))).Params()
+	fg := ui.vx.QueryForegroundContext(ctx).Params()
 	if len(bg) == 3 && len(fg) == 3 && ui.vx.CanRGB() {
 		// Interpolate gray from fg and bg to make it slightly more readable against the background than default gray.
 		p := make([]uint8, 3)

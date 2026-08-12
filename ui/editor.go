@@ -113,7 +113,12 @@ func (e *Editor) recompute() {
 	w := make([]int, 0, len(e.text[e.lineIdx].runes)+1)
 	nc := 0
 	nw := 0
-	for _, g := range vaxis.Characters(string(e.text[e.lineIdx].runes)) {
+	it := vaxis.NewCharacterIterator(string(e.text[e.lineIdx].runes))
+	for {
+		g, ok := it.Next()
+		if !ok {
+			break
+		}
 		c = append(c, nc)
 		w = append(w, nw)
 		nc += len([]rune(g.Grapheme))

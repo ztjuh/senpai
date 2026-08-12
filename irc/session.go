@@ -495,7 +495,12 @@ func splitChunks(s string, chunkLen int) (chunks []string) {
 
 	b := 0
 	n := 0
-	for _, c := range vaxis.Characters(s) {
+	it := vaxis.NewCharacterIterator(s)
+	for {
+		c, ok := it.Next()
+		if !ok {
+			break
+		}
 		cw := len(c.Grapheme)
 		if n+cw > chunkLen {
 			chunks = append(chunks, s[b:b+n])

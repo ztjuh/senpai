@@ -73,7 +73,12 @@ func truncate(vx *Vaxis, s string, w int, tail string) string {
 
 	width := 0
 	var sb strings.Builder
-	for _, c := range vaxis.Characters(s) {
+	it := vaxis.NewCharacterIterator(s)
+	for {
+		c, ok := it.Next()
+		if !ok {
+			break
+		}
 		chWidth := stringWidth(vx, c.Grapheme)
 		if width+chWidth > w {
 			break

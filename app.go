@@ -1213,6 +1213,7 @@ func (app *App) handleChannelEvent(ev *events.EventClickChannel) {
 
 var patternOpenGraphImage = regexp.MustCompile(`<meta property="og:image" content="(.*?)"/?>`)
 var patternOpenGraphVideo = regexp.MustCompile(`<meta property="og:video"`)
+var errVideoLink = errors.New("video link")
 
 func (app *App) fetchImage(link string) (image.Image, error) {
 	userAgent := "senpai"
@@ -1253,6 +1254,9 @@ func (app *App) fetchImage(link string) (image.Image, error) {
 	if err != nil {
 		return nil, fmt.Errorf("unexpected content type: %v", res.Header.Get("Content-Type"))
 	}
+	if strings.HasPrefix(contentType, "video/") {
+		return nil, errVideoLink
+	}
 	var isHTML bool
 	switch contentType {
 	case "image/gif", "image/jpeg", "image/png": // Actual image, fetch
@@ -1282,7 +1286,7 @@ func (app *App) fetchImage(link string) (image.Image, error) {
 		}
 		if patternOpenGraphVideo.Match(b) {
 			// Do not display image (previews) of video objects
-			return nil, fmt.Errorf("video embed found")
+			return nil, errVideoLink
 		}
 		m := patternOpenGraphImage.FindSubmatch(b)
 		if len(m) < 2 {
@@ -1310,11 +1314,40 @@ func (app *App) fetchImage(link string) (image.Image, error) {
 	return img, nil
 }
 
+func isVideoURL(link string) bool {
+	u, err := url.Parse(link)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSuffix(u.Hostname(), ".")) {
+	case "youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be":
+		return true
+	}
+	ext := strings.ToLower(strings.TrimSuffix(u.Path, "/"))
+	for _, suffix := range []string{".avi", ".flv", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg", ".m3u8", ".ogv", ".ts", ".webm", ".wmv"} {
+		if strings.HasSuffix(ext, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
 func (app *App) handleLinkEvent(ev *events.EventClickLink) {
-	open := func() {
+	open := func(useMPV bool) {
 		if strings.HasPrefix(ev.Link, "-") {
 			// Avoid injection of parameters.
-			// Sadly xdg-open does not support "--"...
+			return
+		}
+		if useMPV || isVideoURL(ev.Link) {
+			cmd := exec.Command("mpv", "--profile=sw-fast", "--vo=kitty", "--vo-kitty-use-shm=yes", "--really-quiet", ev.Link)
+			cmd.Stdin = os.Stdin
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			if err := app.win.SuspendTerminal(); err != nil {
+				return
+			}
+			cmd.Run()
+			_ = app.win.ResumeTerminal()
 			return
 		}
 		cmd := exec.Command("xdg-open", ev.Link)
@@ -1327,8 +1360,16 @@ func (app *App) handleLinkEvent(ev *events.EventClickLink) {
 
 			// Explicit external link open requested with Ctrl+Click:
 			// just run xdg-open.
-			go open()
+			if isVideoURL(ev.Link) {
+				open(true)
+			} else {
+				go open(false)
+			}
 		}
+		return
+	}
+	if isVideoURL(ev.Link) {
+		open(true)
 		return
 	}
 
@@ -1347,7 +1388,7 @@ func (app *App) handleLinkEvent(ev *events.EventClickLink) {
 				},
 			})
 			if ev.Mouse {
-				open()
+				open(errors.Is(err, errVideoLink))
 			}
 		} else {
 			app.postEvent(event{

@@ -741,6 +741,14 @@ func (ui *UI) Size() (int, int) {
 	return ui.vx.window.Size()
 }
 
+func (ui *UI) SuspendTerminal() error {
+	return ui.vx.Suspend()
+}
+
+func (ui *UI) ResumeTerminal() error {
+	return ui.vx.Resume()
+}
+
 func (ui *UI) Beep() {
 	ui.vx.Bell()
 }

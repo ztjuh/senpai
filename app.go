@@ -1338,16 +1338,25 @@ func (app *App) handleLinkEvent(ev *events.EventClickLink) {
 			// Avoid injection of parameters.
 			return
 		}
-		if useMPV || isVideoURL(ev.Link) {
-			cmd := exec.Command("mpv", "--profile=sw-fast", "--vo=kitty", "--vo-kitty-use-shm=yes", "--really-quiet", ev.Link)
+		if useMPV {
+			args := []string{"--profile=sw-fast", "--really-quiet"}
+			if app.win.IsKittyTerminal() {
+				args = append(args, "--vo=kitty", "--vo-kitty-use-shm=yes")
+			}
+			args = append(args, ev.Link)
+			cmd := exec.Command("mpv", args...)
 			cmd.Stdin = os.Stdin
 			cmd.Stdout = os.Stdout
 			cmd.Stderr = os.Stderr
 			if err := app.win.SuspendTerminal(); err != nil {
 				return
 			}
-			cmd.Run()
-			_ = app.win.ResumeTerminal()
+			if err := cmd.Run(); err != nil {
+				// optionally report failure in senpai
+			}
+			if err := app.win.ResumeTerminal(); err != nil {
+				return
+			}
 			return
 		}
 		cmd := exec.Command("xdg-open", ev.Link)

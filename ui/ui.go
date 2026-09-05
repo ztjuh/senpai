@@ -749,6 +749,10 @@ func (ui *UI) ResumeTerminal() error {
 	return ui.vx.Resume()
 }
 
+func (ui *UI) IsKittyTerminal() bool {
+	return strings.HasPrefix(strings.ToLower(ui.vx.TerminalID()), "kitty") || os.Getenv("TERM") == "xterm-kitty"
+}
+
 func (ui *UI) Beep() {
 	ui.vx.Bell()
 }

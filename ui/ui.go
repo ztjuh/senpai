@@ -93,7 +93,8 @@ type UI struct {
 
 	clickEvents []clickEvent
 
-	image vaxis.Image
+	image      vaxis.Image
+	videoFrame *image.RGBA
 
 	mouseLinks bool
 
@@ -506,6 +507,15 @@ func (ui *UI) AddLine(netID, buffer string, line Line) {
 	}
 }
 
+// AddLineVideoPlayer adds a line to the standalone video player buffer.
+func (ui *UI) AddLineVideoPlayer(line Line) {
+	ui.bs.AddLine("", "video-player", line)
+}
+
+func (ui *UI) AddLineDebug(line Line) {
+	ui.bs.AddLine("", "debug", line)
+}
+
 func (ui *UI) AddLines(netID, buffer string, before, after []Line) {
 	ui.bs.AddLines(netID, buffer, before, after)
 }
@@ -786,12 +796,19 @@ func (ui *UI) ShowImage(img image.Image) bool {
 	if err != nil {
 		return false
 	}
+	if ui.image != nil {
+		ui.image.Destroy()
+	}
 	w, h := ui.vx.window.Size()
 	w = w * 9 / 10
 	h = h * 9 / 10
 	vi.Resize(w, h)
 	ui.image = vi
 	return true
+}
+
+func (ui *UI) SetVideoFrame(frame *image.RGBA) {
+	ui.videoFrame = frame
 }
 
 func (ui *UI) AsyncCompletions(id int, cs []Completion) {
@@ -804,6 +821,9 @@ func (ui *UI) Draw(members []irc.Member) {
 	w, h := ui.vx.window.Size()
 
 	ui.bs.DrawTimeline(ui, ui.channelWidth, 0, ui.config.NickColWidth)
+	if _, buffer := ui.bs.Current(); buffer == "video-player" {
+		ui.drawVideoPlayer()
+	}
 	if ui.channelWidth == 0 {
 		ui.bs.DrawHorizontalBufferList(ui.vx, 0, h-1, w-ui.memberWidth, &ui.channelOffset)
 	} else {
@@ -852,6 +872,28 @@ func (ui *UI) Draw(members []irc.Member) {
 	}
 
 	ui.vx.Render()
+}
+
+func (ui *UI) drawVideoPlayer() {
+	frame := ui.videoFrame
+	width := ui.bs.tlInnerWidth
+	height := ui.bs.tlHeight
+	x0 := ui.channelWidth + 9 + ui.config.NickColWidth
+	y0 := 2
+	if frame == nil {
+		return
+	}
+	frameBounds := frame.Bounds()
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			upper := frame.RGBAAt(frameBounds.Min.X+x*frameBounds.Dx()/width, frameBounds.Min.Y+(y*2)*frameBounds.Dy()/(height*2))
+			lower := frame.RGBAAt(frameBounds.Min.X+x*frameBounds.Dx()/width, frameBounds.Min.Y+min((y*2+1)*frameBounds.Dy()/(height*2), frameBounds.Max.Y-1))
+			setCell(ui.vx, x0+x, y0+y, '▀', vaxis.Style{
+				Foreground: vaxis.RGBColor(upper.R, upper.G, upper.B),
+				Background: vaxis.RGBColor(lower.R, lower.G, lower.B),
+			})
+		}
+	}
 }
 
 func (ui *UI) ScrollToBuffer() {

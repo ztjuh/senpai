@@ -1,6 +1,7 @@
 package senpai
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -37,6 +38,9 @@ import (
 )
 
 const eventChanSize = 1024
+
+const videoPlayerBuffer = "video-player"
+const debugBuffer = "debug"
 
 func isCommand(input []rune) bool {
 	// Command can't start with two slashes because that's an escape for
@@ -97,6 +101,16 @@ type event struct {
 	content interface{}
 }
 
+type videoStopped struct{}
+
+type videoFrame struct {
+	frame *image.RGBA
+}
+
+type videoDebug struct {
+	message string
+}
+
 type boundKey struct {
 	netID  string
 	target string
@@ -147,6 +161,7 @@ type App struct {
 
 	imageLoading bool
 	imageOverlay bool
+	videoCancel  context.CancelFunc
 
 	uploadingProgress *float64
 
@@ -156,6 +171,9 @@ type App struct {
 	closing atomic.Bool
 
 	harper *harperState
+
+	debugLog   *os.File
+	debugLogMu sync.Mutex
 }
 
 func NewApp(cfg Config) (app *App, err error) {
@@ -193,6 +211,10 @@ func NewApp(cfg Config) (app *App, err error) {
 			app.shortcuts[*k] = actions
 		}
 	}
+	app.debugLog, err = os.OpenFile("debug.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC|os.O_APPEND, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("open debug.log: %w", err)
+	}
 
 	if cfg.Highlights != nil {
 		app.highlights = make([]string, len(cfg.Highlights))
@@ -223,6 +245,7 @@ func NewApp(cfg Config) (app *App, err error) {
 		WithConsole:       cfg.WithConsole,
 	})
 	if err != nil {
+		app.debugLog.Close()
 		return
 	}
 
@@ -243,6 +266,7 @@ func NewApp(cfg Config) (app *App, err error) {
 }
 
 func (app *App) Close() {
+	app.stopVideo()
 	app.win.Exit()       // tell all instances of app.ircLoop to stop when possible
 	app.postEvent(event{ // tell app.eventLoop to stop
 		src:     "*",
@@ -254,6 +278,12 @@ func (app *App) Close() {
 	ui.DBusStop()
 	app.harperClose()
 	app.closing.Store(true)
+	app.debugLogMu.Lock()
+	if app.debugLog != nil {
+		app.debugLog.Close()
+		app.debugLog = nil
+	}
+	app.debugLogMu.Unlock()
 	go func() {
 		// drain remaining events
 		for {
@@ -328,7 +358,7 @@ func (app *App) eventLoop() {
 
 		if !app.pasting {
 			if app.win.Focused() {
-				if netID, buffer, timestamp := app.win.UpdateRead(); buffer != "" {
+				if netID, buffer, timestamp := app.win.UpdateRead(); buffer != "" && buffer != videoPlayerBuffer && buffer != debugBuffer {
 					s := app.sessions[netID]
 					if s != nil {
 						s.ReadSet(buffer, timestamp)
@@ -663,6 +693,16 @@ func (app *App) handleUIEvent(ev interface{}) bool {
 		if ev.Image == nil {
 			app.imageLoading = false
 		}
+	case videoStopped:
+		app.imageOverlay = false
+	case videoFrame:
+		app.win.SetVideoFrame(ev.frame)
+	case videoDebug:
+		app.win.AddLineDebug(ui.Line{
+			At:   time.Now(),
+			Head: ui.PlainString("video --"),
+			Body: ui.PlainString(ev.message),
+		})
 	case *events.EventFileUpload:
 		if ev.Location != "" {
 			app.uploadingProgress = nil
@@ -742,6 +782,7 @@ func (app *App) handleMouseEvent(ev vaxis.Mouse) {
 
 	if app.imageOverlay && ev.Button == vaxis.MouseLeftButton {
 		if ev.EventType == vaxis.EventPress {
+			app.stopVideo()
 			app.win.ShowImage(nil)
 			app.imageOverlay = false
 		}
@@ -1332,31 +1373,22 @@ func isVideoURL(link string) bool {
 	return false
 }
 
+func isYouTubeURL(link string) bool {
+	u, err := url.Parse(link)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSuffix(u.Hostname(), ".")) {
+	case "youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be":
+		return true
+	default:
+		return false
+	}
+}
+
 func (app *App) handleLinkEvent(ev *events.EventClickLink) {
-	open := func(useMPV bool) {
+	open := func() {
 		if strings.HasPrefix(ev.Link, "-") {
-			// Avoid injection of parameters.
-			return
-		}
-		if useMPV {
-			args := []string{"--profile=sw-fast", "--really-quiet"}
-			if app.win.IsKittyTerminal() {
-				args = append(args, "--vo=kitty", "--vo-kitty-use-shm=yes")
-			}
-			args = append(args, ev.Link)
-			cmd := exec.Command("mpv", args...)
-			cmd.Stdin = os.Stdin
-			cmd.Stdout = os.Stdout
-			cmd.Stderr = os.Stderr
-			if err := app.win.SuspendTerminal(); err != nil {
-				return
-			}
-			if err := cmd.Run(); err != nil {
-				// optionally report failure in senpai
-			}
-			if err := app.win.ResumeTerminal(); err != nil {
-				return
-			}
 			return
 		}
 		cmd := exec.Command("xdg-open", ev.Link)
@@ -1367,18 +1399,17 @@ func (app *App) handleLinkEvent(ev *events.EventClickLink) {
 		if ev.Mouse {
 			// Only react to Ctrl+Click when mouse links are enabled.
 
-			// Explicit external link open requested with Ctrl+Click:
-			// just run xdg-open.
+			// Ctrl+Click keeps video playback inside video-player.
 			if isVideoURL(ev.Link) {
-				open(true)
+				app.playVideo(ev.Link)
 			} else {
-				go open(false)
+				go open()
 			}
 		}
 		return
 	}
 	if isVideoURL(ev.Link) {
-		open(true)
+		app.playVideo(ev.Link)
 		return
 	}
 
@@ -1397,7 +1428,11 @@ func (app *App) handleLinkEvent(ev *events.EventClickLink) {
 				},
 			})
 			if ev.Mouse {
-				open(errors.Is(err, errVideoLink))
+				if errors.Is(err, errVideoLink) {
+					app.playVideo(ev.Link)
+				} else {
+					go open()
+				}
 			}
 		} else {
 			app.postEvent(event{
@@ -1406,6 +1441,229 @@ func (app *App) handleLinkEvent(ev *events.EventClickLink) {
 					Image: img,
 				},
 			})
+		}
+	}()
+}
+
+func (app *App) stopVideo() {
+	if app.videoCancel != nil {
+		app.videoCancel()
+		app.videoCancel = nil
+	}
+	app.win.SetVideoFrame(nil)
+}
+
+func (app *App) videoDebugf(format string, args ...interface{}) {
+	message := fmt.Sprintf(format, args...)
+	app.debugLogMu.Lock()
+	if app.debugLog != nil {
+		_, _ = fmt.Fprintf(app.debugLog, "%s %s\n", time.Now().Format(time.RFC3339Nano), message)
+	}
+	app.debugLogMu.Unlock()
+	app.postEvent(event{
+		src:     "*",
+		content: videoDebug{message: message},
+	})
+}
+
+func (app *App) captureVideoStderr(name string, reader io.ReadCloser) {
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 4096), 1024*1024)
+	for scanner.Scan() {
+		app.videoDebugf("%s: %s", name, scanner.Text())
+	}
+	if err := scanner.Err(); err != nil {
+		app.videoDebugf("%s stderr read failed: %v", name, err)
+	}
+}
+
+func (app *App) playVideo(link string) {
+	if strings.HasPrefix(link, "-") {
+		return
+	}
+	app.stopVideo()
+	app.win.JumpBufferNetwork("", videoPlayerBuffer)
+	app.win.SetVideoFrame(nil)
+	app.win.ShowImage(nil)
+	app.win.AddLineVideoPlayer(ui.Line{
+		At:   time.Now(),
+		Head: ui.PlainString("--"),
+		Body: ui.PlainString("Playing " + link),
+	})
+	app.videoDebugf("starting playback: %s", link)
+	app.imageOverlay = true
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		app.videoDebugf("ffmpeg lookup failed: %v", err)
+		app.win.AddLineVideoPlayer(ui.Line{
+			At:   time.Now(),
+			Head: ui.ColorString("!!", ui.ColorRed),
+			Body: ui.PlainString("ffmpeg is required for the video player: " + err.Error()),
+		})
+		return
+	}
+	if _, err := exec.LookPath("ffplay"); err != nil {
+		app.videoDebugf("ffplay lookup failed: %v", err)
+		app.win.AddLineVideoPlayer(ui.Line{
+			At:   time.Now(),
+			Head: ui.ColorString("!!", ui.ColorRed),
+			Body: ui.PlainString("ffplay is required for video sound: " + err.Error()),
+		})
+		return
+	}
+	inputURLs := []string{link}
+	if isYouTubeURL(link) {
+		app.videoDebugf("resolving YouTube URL with yt-dlp")
+		if _, err := exec.LookPath("yt-dlp"); err != nil {
+			app.videoDebugf("yt-dlp lookup failed: %v", err)
+			app.win.AddLineVideoPlayer(ui.Line{
+				At:   time.Now(),
+				Head: ui.ColorString("!!", ui.ColorRed),
+				Body: ui.PlainString("yt-dlp is required for YouTube videos: " + err.Error()),
+			})
+			return
+		}
+		resolver := exec.Command("yt-dlp", "--no-playlist", "--get-url", "-f", "bestvideo+bestaudio/best", link)
+		output, err := resolver.Output()
+		if err != nil {
+			app.videoDebugf("yt-dlp failed: %v", err)
+			app.win.AddLineVideoPlayer(ui.Line{
+				At:   time.Now(),
+				Head: ui.ColorString("!!", ui.ColorRed),
+				Body: ui.PlainString("Unable to resolve YouTube video: " + err.Error()),
+			})
+			return
+		}
+		inputURLs = strings.Fields(string(output))
+		app.videoDebugf("yt-dlp returned %d media URLs", len(inputURLs))
+		if len(inputURLs) == 0 {
+			app.win.AddLineVideoPlayer(ui.Line{
+				At:   time.Now(),
+				Head: ui.ColorString("!!", ui.ColorRed),
+				Body: ui.PlainString("yt-dlp returned no playable video URL"),
+			})
+			return
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	app.videoCancel = cancel
+	const (
+		videoWidth  = 320
+		videoHeight = 180
+	)
+	audioReader, audioWriter, err := os.Pipe()
+	if err != nil {
+		app.videoDebugf("audio pipe creation failed: %v", err)
+		cancel()
+		return
+	}
+	audio := exec.CommandContext(ctx, "ffplay", "-loglevel", "error", "-nodisp", "-autoexit", "-f", "s16le", "-ar", "48000", "-ch_layout", "stereo", "-")
+	audio.Stdin = audioReader
+	audio.Stdout = io.Discard
+	audioStderr, err := audio.StderrPipe()
+	if err != nil {
+		audioReader.Close()
+		audioWriter.Close()
+		cancel()
+		app.videoDebugf("ffplay stderr pipe creation failed: %v", err)
+		return
+	}
+	if err := audio.Start(); err != nil {
+		app.videoDebugf("ffplay start failed: %v", err)
+		audioReader.Close()
+		audioWriter.Close()
+		cancel()
+		app.win.AddLineVideoPlayer(ui.Line{
+			At:   time.Now(),
+			Head: ui.ColorString("!!", ui.ColorRed),
+			Body: ui.PlainString("Unable to start ffplay: " + err.Error()),
+		})
+		return
+	}
+	audioReader.Close()
+	app.videoDebugf("ffplay started")
+	go app.captureVideoStderr("ffplay", audioStderr)
+
+	ffmpegArgs := []string{"-loglevel", "error"}
+	for _, inputURL := range inputURLs {
+		ffmpegArgs = append(ffmpegArgs, "-re", "-i", inputURL)
+	}
+	audioInput := 0
+	if len(inputURLs) > 1 {
+		audioInput = 1
+	}
+	ffmpegArgs = append(ffmpegArgs,
+		"-map", "0:v:0",
+		"-vf", "fps=15,scale=320:180:force_original_aspect_ratio=decrease,pad=320:180:(ow-iw)/2:(oh-ih)/2",
+		"-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
+		"-map", fmt.Sprintf("%d:a:0?", audioInput), "-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:3")
+	cmd := exec.CommandContext(ctx, "ffmpeg", ffmpegArgs...)
+	cmd.ExtraFiles = []*os.File{audioWriter}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		app.videoDebugf("video pipe creation failed: %v", err)
+		audioWriter.Close()
+		cancel()
+		return
+	}
+	ffmpegStderr, err := cmd.StderrPipe()
+	if err != nil {
+		audioWriter.Close()
+		cancel()
+		app.videoDebugf("ffmpeg stderr pipe creation failed: %v", err)
+		return
+	}
+	if err := cmd.Start(); err != nil {
+		app.videoDebugf("ffmpeg start failed: %v", err)
+		audioWriter.Close()
+		cancel()
+		audio.Wait()
+		app.win.AddLineVideoPlayer(ui.Line{
+			At:   time.Now(),
+			Head: ui.ColorString("!!", ui.ColorRed),
+			Body: ui.PlainString("Unable to start ffmpeg: " + err.Error()),
+		})
+		return
+	}
+	audioWriter.Close()
+	app.videoDebugf("ffmpeg started; waiting for raw frames")
+	go app.captureVideoStderr("ffmpeg", ffmpegStderr)
+
+	go func() {
+		defer cancel()
+		defer func() {
+			if err := cmd.Wait(); err != nil {
+				app.videoDebugf("ffmpeg exited with error: %v", err)
+			} else {
+				app.videoDebugf("ffmpeg exited normally")
+			}
+			if err := audio.Wait(); err != nil {
+				app.videoDebugf("ffplay exited with error: %v", err)
+			} else {
+				app.videoDebugf("ffplay exited normally")
+			}
+		}()
+		frameSize := videoWidth * videoHeight * 3
+		buffer := make([]byte, frameSize)
+		frameCount := 0
+		for {
+			if _, err := io.ReadFull(stdout, buffer); err != nil {
+				app.videoDebugf("video stream stopped after %d frames: %v", frameCount, err)
+				app.postEvent(event{src: "*", content: videoStopped{}})
+				return
+			}
+			frame := image.NewRGBA(image.Rect(0, 0, videoWidth, videoHeight))
+			for i, j := 0, 0; i < len(frame.Pix); i, j = i+4, j+3 {
+				frame.Pix[i] = buffer[j]
+				frame.Pix[i+1] = buffer[j+1]
+				frame.Pix[i+2] = buffer[j+2]
+				frame.Pix[i+3] = 0xff
+			}
+			frameCount++
+			if frameCount == 1 || frameCount%30 == 0 {
+				app.videoDebugf("decoded video frame %d", frameCount)
+			}
+			app.postEvent(event{src: "*", content: videoFrame{frame: frame}})
 		}
 	}()
 }
@@ -1515,7 +1773,7 @@ func (app *App) maybeRequestHistory() {
 	}
 	netID, buffer := app.win.CurrentBuffer()
 	s := app.sessions[netID]
-	if s == nil {
+	if s == nil || buffer == videoPlayerBuffer || buffer == debugBuffer {
 		return
 	}
 	bk := boundKey{netID, s.Casemap(buffer)}

@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
-	"go.rockorager.dev/vaxis"
 	"github.com/delthas/go-libnp"
+	"go.rockorager.dev/vaxis"
 
 	"git.sr.ht/~delthas/senpai/irc"
 	"git.sr.ht/~delthas/senpai/ui"
@@ -56,6 +56,22 @@ func init() {
 			Desc:      "send command to the bouncer service (only works with soju); e.g. /bouncer help",
 			Handle:    commandDoBouncer,
 		},
+		"ADD": {
+			AllowHome: true,
+			MinArgs:   1,
+			MaxArgs:   1,
+			Usage:     "<url>",
+			Desc:      "add a video, local file, or playlist to the video queue",
+			Handle:    commandDoAdd,
+		},
+		"SETQUALITY": {
+			AllowHome: true,
+			MinArgs:   1,
+			MaxArgs:   1,
+			Usage:     "<1-5>",
+			Desc:      "set video quality (1=360p, 5=2160p)",
+			Handle:    commandDoSetQuality,
+		},
 		"JOIN": {
 			AllowHome: true,
 			MinArgs:   1,
@@ -74,6 +90,36 @@ func init() {
 		"NP": {
 			Desc:   "send the current song that is being played on the system",
 			Handle: commandDoNP,
+		},
+		"PAUSE": {
+			AllowHome: true,
+			Desc:      "pause or resume video playback",
+			Handle:    commandDoPause,
+		},
+		"RESUME": {
+			AllowHome: true,
+			Desc:      "resume paused video playback",
+			Handle:    commandDoResume,
+		},
+		"STOP": {
+			AllowHome: true,
+			Desc:      "stop video playback",
+			Handle:    commandDoStop,
+		},
+		"CLEARPLAYLIST": {
+			AllowHome: true,
+			Desc:      "clear the queued video playlist",
+			Handle:    commandDoClearPlaylist,
+		},
+		"NEXT": {
+			AllowHome: true,
+			Desc:      "skip to the next queued video",
+			Handle:    commandDoNext,
+		},
+		"PREVIOUS": {
+			AllowHome: true,
+			Desc:      "play the previous video",
+			Handle:    commandDoPrevious,
 		},
 		"UPLOAD": {
 			AllowHome: true,
@@ -480,7 +526,7 @@ func commandDoJoin(app *App, args []string) (err error) {
 
 func commandDoMe(app *App, args []string) (err error) {
 	netID, buffer := app.win.CurrentBuffer()
-	if buffer == "" {
+	if buffer == "" || buffer == videoPlayerBuffer || buffer == videoPlayerTextBuffer {
 		netID = app.lastQueryNet
 		buffer = app.lastQuery
 	}
@@ -513,6 +559,70 @@ func commandDoNP(app *App, args []string) (err error) {
 		return fmt.Errorf("no song was detected")
 	}
 	return commandDoMe(app, []string{fmt.Sprintf("np: %s", song)})
+}
+
+func commandDoAdd(app *App, args []string) error {
+	link := args[0]
+	if !isVideoURL(link) && !isYouTubePlaylistURL(link) {
+		return fmt.Errorf("not a supported video URL")
+	}
+	if isYouTubePlaylistURL(link) {
+		app.resolvePlaylistAsync(link, true)
+		return nil
+	}
+	app.videoQueue = append(app.videoQueue, link)
+	app.videoDebugf("added video to queue; queue length: %d", len(app.videoQueue))
+	if !app.videoPlaying {
+		app.playNextVideo()
+	}
+	return nil
+}
+
+func commandDoPause(app *App, args []string) error {
+	return app.pauseVideo()
+}
+
+func commandDoSetQuality(app *App, args []string) error {
+	quality, err := strconv.Atoi(args[0])
+	if err != nil {
+		return fmt.Errorf("quality must be a number from 1 to 5")
+	}
+	return app.setVideoQuality(quality)
+}
+
+func commandDoResume(app *App, args []string) error {
+	if !app.videoPaused {
+		if !app.videoPlaying {
+			if len(app.videoQueue) > 0 {
+				app.playNextVideo()
+				return nil
+			}
+			return errors.New("no video is playing")
+		}
+		return errors.New("video is not paused")
+	}
+	return app.pauseVideo()
+}
+
+func commandDoStop(app *App, args []string) error {
+	if !app.videoPlaying {
+		return errors.New("no video is playing")
+	}
+	app.stopVideo()
+	return nil
+}
+
+func commandDoClearPlaylist(app *App, args []string) error {
+	app.clearVideoPlaylist()
+	return nil
+}
+
+func commandDoNext(app *App, args []string) error {
+	return app.nextVideo()
+}
+
+func commandDoPrevious(app *App, args []string) error {
+	return app.previousVideo()
 }
 
 func commandDoUpload(app *App, args []string) (err error) {

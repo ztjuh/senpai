@@ -16,7 +16,9 @@ func (app *App) initWindow() {
 	}
 	app.win.AddBuffer("", "(home)", "")
 	app.win.AddBuffer("", "", "video-player")
+	app.win.AddBuffer("", "", "video-player-text")
 	app.win.AddBuffer("", "", "debug")
+	app.win.AddBuffer("", "", "history")
 	app.win.AddLine("", "", ui.Line{
 		Head: ui.PlainString("--"),
 		Body: ui.PlainString(fmt.Sprintf("Welcome to senpai %v! To get started, use the Help buttons, or enter /help for a list of commands.", version)),

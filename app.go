@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"html"
@@ -18,12 +19,14 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -40,7 +43,9 @@ import (
 const eventChanSize = 1024
 
 const videoPlayerBuffer = "video-player"
+const videoPlayerTextBuffer = "video-player-text"
 const debugBuffer = "debug"
+const videoHistoryBuffer = "history"
 
 func isCommand(input []rune) bool {
 	// Command can't start with two slashes because that's an escape for
@@ -111,6 +116,23 @@ type videoDebug struct {
 	message string
 }
 
+type videoPlaylistResolved struct {
+	urls        []string
+	appendQueue bool
+	err         error
+}
+
+type videoMediaResolved struct {
+	link    string
+	urls    []string
+	quality int
+	err     error
+}
+
+type videoHistoryInfo struct {
+	body string
+}
+
 type boundKey struct {
 	netID  string
 	target string
@@ -159,10 +181,20 @@ type App struct {
 
 	lastConfirm string
 
-	imageLoading bool
-	imageOverlay bool
-	videoPlaying bool
-	videoCancel  context.CancelFunc
+	imageLoading       bool
+	imageOverlay       bool
+	videoPlaying       bool
+	videoPaused        bool
+	videoCancel        context.CancelFunc
+	videoProcess       *os.Process
+	audioProcess       *os.Process
+	videoQueue         []string
+	videoHistory       []string
+	videoCurrent       string
+	videoQuality       int
+	videoStopRequested bool
+	videoFPSStarted    time.Time
+	videoFPSFrames     int
 
 	uploadingProgress *float64
 
@@ -359,7 +391,7 @@ func (app *App) eventLoop() {
 
 		if !app.pasting {
 			if app.win.Focused() {
-				if netID, buffer, timestamp := app.win.UpdateRead(); buffer != "" && buffer != videoPlayerBuffer && buffer != debugBuffer {
+				if netID, buffer, timestamp := app.win.UpdateRead(); buffer != "" && buffer != videoPlayerBuffer && buffer != videoPlayerTextBuffer && buffer != debugBuffer && buffer != videoHistoryBuffer {
 					s := app.sessions[netID]
 					if s != nil {
 						s.ReadSet(buffer, timestamp)
@@ -695,9 +727,29 @@ func (app *App) handleUIEvent(ev interface{}) bool {
 			app.imageLoading = false
 		}
 	case videoStopped:
-		app.imageOverlay = false
-		app.videoPlaying = false
+		if app.videoStopRequested {
+			app.videoDebugf("playback stopped; preserving %d queued video(s)", len(app.videoQueue))
+			app.videoStopRequested = false
+			app.imageOverlay = false
+			app.videoPlaying = false
+		} else if len(app.videoQueue) > 0 {
+			app.videoDebugf("video ended; advancing to next queued video (%d remaining)", len(app.videoQueue))
+			app.playNextVideo()
+		} else {
+			app.videoDebugf("video ended; playlist complete")
+			app.imageOverlay = false
+			app.videoPlaying = false
+		}
 	case videoFrame:
+		if app.videoFPSStarted.IsZero() {
+			app.videoFPSStarted = time.Now()
+		}
+		app.videoFPSFrames++
+		if elapsed := time.Since(app.videoFPSStarted); elapsed >= time.Second {
+			app.win.SetVideoFPS(float64(app.videoFPSFrames) / elapsed.Seconds())
+			app.videoFPSStarted = time.Now()
+			app.videoFPSFrames = 0
+		}
 		app.win.SetVideoFrame(ev.frame)
 	case videoDebug:
 		app.win.AddLineDebug(ui.Line{
@@ -705,6 +757,36 @@ func (app *App) handleUIEvent(ev interface{}) bool {
 			Head: ui.PlainString("video --"),
 			Body: ui.PlainString(ev.message),
 		})
+	case videoHistoryInfo:
+		app.win.AddLineVideoHistory(ui.Line{At: time.Now(), Head: ui.PlainString("info --"), Body: ui.PlainString(ev.body)})
+	case videoPlaylistResolved:
+		if ev.err != nil {
+			app.videoDebugf("playlist resolution failed: %v", ev.err)
+			app.win.AddLineVideoPlayer(ui.Line{At: time.Now(), Head: ui.ColorString("!!", ui.ColorRed), Body: ui.PlainString("Unable to resolve playlist: " + ev.err.Error())})
+			break
+		}
+		if len(ev.urls) == 0 {
+			app.win.AddLineVideoPlayer(ui.Line{At: time.Now(), Head: ui.ColorString("!!", ui.ColorRed), Body: ui.PlainString("Playlist contains no videos")})
+			break
+		}
+		if !ev.appendQueue {
+			app.videoHistory = nil
+			app.videoCurrent = ""
+		}
+		app.videoQueue = append(app.videoQueue, ev.urls...)
+		app.videoDebugf("added %d playlist video(s) to queue; queue length: %d", len(ev.urls), len(app.videoQueue))
+		if !ev.appendQueue {
+			app.playNextVideo()
+		} else if !app.videoPlaying {
+			app.playNextVideo()
+		}
+	case videoMediaResolved:
+		if ev.err != nil {
+			app.videoDebugf("media resolution failed: %v", ev.err)
+			app.win.AddLineVideoPlayer(ui.Line{At: time.Now(), Head: ui.ColorString("!!", ui.ColorRed), Body: ui.PlainString("Unable to resolve video: " + ev.err.Error())})
+			break
+		}
+		app.startVideoWithURLs(ev.link, ev.urls)
 	case *events.EventFileUpload:
 		if ev.Location != "" {
 			app.uploadingProgress = nil
@@ -1202,6 +1284,15 @@ func (app *App) handleKeyEvent(ev vaxis.Key) {
 		// Drop text when sent with modifiers preventing text
 		ev.Text = ""
 	}
+	if len(ev.Text) == 1 && ev.Text[0] >= '1' && ev.Text[0] <= '5' && ev.Modifiers == 0 {
+		_, buffer := app.win.CurrentBuffer()
+		if buffer == videoPlayerBuffer && len(app.win.InputContent()) == 0 {
+			if err := app.setVideoQuality(int(ev.Text[0] - '0')); err != nil {
+				app.videoDebugf("quality selection failed: %v", err)
+			}
+			return
+		}
+	}
 	if ev.Text != "" {
 		for _, r := range ev.Text {
 			app.win.InputRune(r)
@@ -1358,12 +1449,15 @@ func (app *App) fetchImage(link string) (image.Image, error) {
 }
 
 func isVideoURL(link string) bool {
+	if isLocalVideoPath(link) {
+		return true
+	}
 	u, err := url.Parse(link)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
 		return false
 	}
 	switch strings.ToLower(strings.TrimSuffix(u.Hostname(), ".")) {
-	case "youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be":
+	case "youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be", "twitch.tv", "www.twitch.tv", "m.twitch.tv", "clips.twitch.tv":
 		return true
 	}
 	ext := strings.ToLower(strings.TrimSuffix(u.Path, "/"))
@@ -1373,6 +1467,39 @@ func isVideoURL(link string) bool {
 		}
 	}
 	return false
+}
+
+func isLocalVideoPath(path string) bool {
+	if !filepath.IsAbs(path) && !strings.HasPrefix(path, "~/") {
+		return false
+	}
+	if !isVideoFilePath(path) {
+		return false
+	}
+	path = expandLocalVideoPath(path)
+	info, err := os.Stat(path)
+	return err == nil && info.Mode().IsRegular()
+}
+
+func isVideoFilePath(path string) bool {
+	ext := strings.ToLower(filepath.Ext(path))
+	for _, suffix := range []string{".avi", ".flv", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg", ".ogv", ".ts", ".webm", ".wmv"} {
+		if ext == suffix {
+			return true
+		}
+	}
+	return false
+}
+
+func expandLocalVideoPath(path string) string {
+	if !strings.HasPrefix(path, "~/") {
+		return path
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return path
+	}
+	return filepath.Join(home, path[2:])
 }
 
 func isYouTubeURL(link string) bool {
@@ -1386,6 +1513,31 @@ func isYouTubeURL(link string) bool {
 	default:
 		return false
 	}
+}
+
+func isTwitchURL(link string) bool {
+	u, err := url.Parse(link)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSuffix(u.Hostname(), ".")) {
+	case "twitch.tv", "www.twitch.tv", "m.twitch.tv", "clips.twitch.tv":
+		return true
+	default:
+		return false
+	}
+}
+
+func isVideoServiceURL(link string) bool {
+	return isYouTubeURL(link) || isTwitchURL(link)
+}
+
+func isYouTubePlaylistURL(link string) bool {
+	if !isYouTubeURL(link) {
+		return false
+	}
+	u, err := url.Parse(link)
+	return err == nil && u.Query().Get("list") != ""
 }
 
 func (app *App) handleLinkEvent(ev *events.EventClickLink) {
@@ -1453,7 +1605,39 @@ func (app *App) stopVideo() {
 		app.videoCancel = nil
 	}
 	app.videoPlaying = false
+	app.videoPaused = false
+	app.imageOverlay = false
+	app.videoProcess = nil
+	app.audioProcess = nil
+	app.videoStopRequested = true
+	app.videoFPSStarted = time.Time{}
+	app.videoFPSFrames = 0
+	app.win.SetVideoFPS(0)
 	app.win.SetVideoFrame(nil)
+}
+
+func (app *App) clearVideoPlaylist() {
+	app.videoQueue = nil
+	app.videoDebugf("video playlist cleared")
+}
+
+func (app *App) pauseVideo() error {
+	if !app.videoPlaying || app.videoProcess == nil || app.audioProcess == nil {
+		return errors.New("no video is playing")
+	}
+	signal := syscall.SIGSTOP
+	if app.videoPaused {
+		signal = syscall.SIGCONT
+	}
+	if err := app.videoProcess.Signal(signal); err != nil {
+		return fmt.Errorf("signal ffmpeg: %w", err)
+	}
+	if err := app.audioProcess.Signal(signal); err != nil {
+		return fmt.Errorf("signal ffplay: %w", err)
+	}
+	app.videoPaused = !app.videoPaused
+	app.videoDebugf("playback %s", map[bool]string{true: "paused", false: "resumed"}[app.videoPaused])
+	return nil
 }
 
 func (app *App) videoDebugf(format string, args ...interface{}) {
@@ -1480,11 +1664,230 @@ func (app *App) captureVideoStderr(name string, reader io.ReadCloser) {
 	}
 }
 
+func (app *App) runYTDLP(args ...string) ([]byte, error) {
+	return app.runYTDLPOutput(nil, args...)
+}
+
+func (app *App) runYTDLPOutput(onLine func(string), args ...string) ([]byte, error) {
+	resolver := exec.Command("yt-dlp", args...)
+	stdout, err := resolver.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	stderr, err := resolver.StderrPipe()
+	if err != nil {
+		return nil, err
+	}
+	if err := resolver.Start(); err != nil {
+		return nil, err
+	}
+	stderrDone := make(chan struct{})
+	go func() {
+		defer close(stderrDone)
+		app.captureVideoStderr("yt-dlp", stderr)
+	}()
+	var output strings.Builder
+	reader := bufio.NewReader(stdout)
+	var readErr error
+	for {
+		line, err := reader.ReadString('\n')
+		if len(line) > 0 {
+			output.WriteString(line)
+			line = strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
+			if onLine != nil && line != "" {
+				onLine(line)
+			}
+		}
+		if err != nil {
+			if err != io.EOF {
+				readErr = err
+			}
+			break
+		}
+	}
+	waitErr := resolver.Wait()
+	<-stderrDone
+	if readErr != nil {
+		return nil, readErr
+	}
+	return []byte(output.String()), waitErr
+}
+
+func (app *App) resolvePlaylistAsync(link string, appendQueue bool) {
+	go func() {
+		app.videoDebugf("resolving YouTube playlist with yt-dlp")
+		output, err := app.runYTDLPOutput(func(line string) {
+			app.videoDebugf("yt-dlp playlist: %s", line)
+		}, "--flat-playlist", "--yes-playlist", "--print", "webpage_url", link)
+		urls := strings.Fields(string(output))
+		app.videoDebugf("playlist contains %d videos", len(urls))
+		for i, item := range urls {
+			app.videoDebugf("playlist item %d/%d: %s", i+1, len(urls), item)
+		}
+		app.postEvent(event{src: "*", content: videoPlaylistResolved{urls: urls, appendQueue: appendQueue, err: err}})
+	}()
+}
+
+func (app *App) resolveMediaAsync(link string) {
+	app.resolveMediaQualityAsync(link, app.videoQuality)
+}
+
+func (app *App) resolveMediaQualityAsync(link string, quality int) {
+	go func() {
+		selector := "bestvideo+bestaudio/best"
+		if quality > 0 {
+			maxHeight := map[int]int{1: 360, 2: 480, 3: 720, 4: 1080, 5: 2160}[quality]
+			selector = fmt.Sprintf("bestvideo[height<=%d]+bestaudio/best[height<=%d]/best", maxHeight, maxHeight)
+		}
+		app.videoDebugf("resolving video URL with yt-dlp at quality %d: %s", quality, link)
+		output, err := app.runYTDLP("--no-playlist", "--get-url", "-f", selector, link)
+		urls := strings.Fields(string(output))
+		app.videoDebugf("yt-dlp returned %d media URLs", len(urls))
+		app.postEvent(event{src: "*", content: videoMediaResolved{link: link, urls: urls, quality: quality, err: err}})
+	}()
+}
+
+func (app *App) setVideoQuality(quality int) error {
+	if quality < 1 || quality > 5 {
+		return errors.New("video quality must be between 1 and 5")
+	}
+	if !app.videoPlaying || app.videoCurrent == "" {
+		return errors.New("no video is playing")
+	}
+	if !isVideoServiceURL(app.videoCurrent) {
+		return errors.New("quality selection is only available for YouTube and Twitch videos")
+	}
+	app.videoQuality = quality
+	app.stopVideo()
+	app.videoStopRequested = false
+	app.videoDebugf("changing video quality to %d", quality)
+	app.resolveMediaQualityAsync(app.videoCurrent, quality)
+	return nil
+}
+
+func (app *App) recordVideoHistory(link string) {
+	app.win.AddLineVideoHistory(ui.Line{
+		At:   time.Now(),
+		Head: ui.PlainString("url --"),
+		Body: ui.PlainString(link),
+	})
+	if !isVideoServiceURL(link) {
+		return
+	}
+	go func() {
+		output, err := app.runYTDLP("--no-playlist", "--skip-download", "--dump-single-json", link)
+		if err != nil {
+			app.videoDebugf("video history metadata failed: %v", err)
+			return
+		}
+		var metadata struct {
+			Title       string `json:"title"`
+			Uploader    string `json:"uploader"`
+			Duration    string `json:"duration_string"`
+			Description string `json:"description"`
+		}
+		if err := json.Unmarshal(output, &metadata); err != nil {
+			app.videoDebugf("video history metadata parse failed: %v", err)
+			return
+		}
+		var details []string
+		if metadata.Title != "" {
+			details = append(details, "Title: "+metadata.Title)
+		}
+		if metadata.Uploader != "" {
+			details = append(details, "Uploader: "+metadata.Uploader)
+		}
+		if metadata.Duration != "" {
+			details = append(details, "Duration: "+metadata.Duration)
+		}
+		if metadata.Description != "" {
+			description := strings.Join(strings.Fields(metadata.Description), " ")
+			if len(description) > 240 {
+				description = description[:240] + "..."
+			}
+			details = append(details, "Description: "+description)
+		}
+		if len(details) > 0 {
+			app.postEvent(event{src: "*", content: videoHistoryInfo{body: strings.Join(details, " | ")}})
+		}
+	}()
+}
+
 func (app *App) playVideo(link string) {
 	if strings.HasPrefix(link, "-") {
 		return
 	}
+	if isLocalVideoPath(link) {
+		link = expandLocalVideoPath(link)
+	}
 	app.stopVideo()
+	app.clearVideoPlaylist()
+	app.videoHistory = nil
+	app.videoCurrent = ""
+	if isYouTubePlaylistURL(link) {
+		app.win.JumpBufferNetwork("", videoPlayerBuffer)
+		app.resolvePlaylistAsync(link, false)
+		return
+	}
+	app.videoCurrent = link
+	app.startVideo(link)
+}
+
+func (app *App) playNextVideo() {
+	if len(app.videoQueue) == 0 {
+		return
+	}
+	link := app.videoQueue[0]
+	app.videoQueue = app.videoQueue[1:]
+	if isLocalVideoPath(link) {
+		link = expandLocalVideoPath(link)
+	}
+	if app.videoCurrent != "" {
+		app.videoHistory = append(app.videoHistory, app.videoCurrent)
+	}
+	app.videoCurrent = link
+	app.startVideo(link)
+}
+
+func (app *App) nextVideo() error {
+	if !app.videoPlaying && len(app.videoQueue) == 0 {
+		return errors.New("no next video is queued")
+	}
+	if app.videoPlaying {
+		app.stopVideo()
+	}
+	if len(app.videoQueue) == 0 {
+		return nil
+	}
+	app.playNextVideo()
+	return nil
+}
+
+func (app *App) previousVideo() error {
+	if len(app.videoHistory) == 0 {
+		return errors.New("no previous video is available")
+	}
+	app.stopVideo()
+	if app.videoCurrent != "" {
+		app.videoQueue = append([]string{app.videoCurrent}, app.videoQueue...)
+	}
+	last := len(app.videoHistory) - 1
+	app.videoCurrent = app.videoHistory[last]
+	app.videoHistory = app.videoHistory[:last]
+	app.startVideo(app.videoCurrent)
+	return nil
+}
+
+func (app *App) startVideo(link string) {
+	app.recordVideoHistory(link)
+	if isVideoServiceURL(link) {
+		app.resolveMediaAsync(link)
+		return
+	}
+	app.startVideoWithURLs(link, []string{link})
+}
+
+func (app *App) startVideoWithURLs(link string, inputURLs []string) {
 	app.win.JumpBufferNetwork("", videoPlayerBuffer)
 	app.win.SetVideoFrame(nil)
 	app.win.ShowImage(nil)
@@ -1495,7 +1898,6 @@ func (app *App) playVideo(link string) {
 	})
 	app.videoDebugf("starting playback: %s", link)
 	app.imageOverlay = true
-	app.videoPlaying = true
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
 		app.videoDebugf("ffmpeg lookup failed: %v", err)
 		app.win.AddLineVideoPlayer(ui.Line{
@@ -1514,39 +1916,9 @@ func (app *App) playVideo(link string) {
 		})
 		return
 	}
-	inputURLs := []string{link}
-	if isYouTubeURL(link) {
-		app.videoDebugf("resolving YouTube URL with yt-dlp")
-		if _, err := exec.LookPath("yt-dlp"); err != nil {
-			app.videoDebugf("yt-dlp lookup failed: %v", err)
-			app.win.AddLineVideoPlayer(ui.Line{
-				At:   time.Now(),
-				Head: ui.ColorString("!!", ui.ColorRed),
-				Body: ui.PlainString("yt-dlp is required for YouTube videos: " + err.Error()),
-			})
-			return
-		}
-		resolver := exec.Command("yt-dlp", "--no-playlist", "--get-url", "-f", "bestvideo+bestaudio/best", link)
-		output, err := resolver.Output()
-		if err != nil {
-			app.videoDebugf("yt-dlp failed: %v", err)
-			app.win.AddLineVideoPlayer(ui.Line{
-				At:   time.Now(),
-				Head: ui.ColorString("!!", ui.ColorRed),
-				Body: ui.PlainString("Unable to resolve YouTube video: " + err.Error()),
-			})
-			return
-		}
-		inputURLs = strings.Fields(string(output))
-		app.videoDebugf("yt-dlp returned %d media URLs", len(inputURLs))
-		if len(inputURLs) == 0 {
-			app.win.AddLineVideoPlayer(ui.Line{
-				At:   time.Now(),
-				Head: ui.ColorString("!!", ui.ColorRed),
-				Body: ui.PlainString("yt-dlp returned no playable video URL"),
-			})
-			return
-		}
+	if len(inputURLs) == 0 {
+		app.win.AddLineVideoPlayer(ui.Line{At: time.Now(), Head: ui.ColorString("!!", ui.ColorRed), Body: ui.PlainString("yt-dlp returned no playable video URL")})
+		return
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1582,6 +1954,7 @@ func (app *App) playVideo(link string) {
 		})
 		return
 	}
+	app.audioProcess = audio.Process
 	audioReader.Close()
 	app.videoDebugf("ffplay started")
 	go app.captureVideoStderr("ffplay", audioStderr)
@@ -1634,6 +2007,9 @@ func (app *App) playVideo(link string) {
 		})
 		return
 	}
+	app.videoProcess = cmd.Process
+	app.videoPlaying = true
+	app.videoStopRequested = false
 	audioWriter.Close()
 	app.videoDebugf("ffmpeg started; waiting for raw frames")
 	go app.captureVideoStderr("ffmpeg", ffmpegStderr)
@@ -1651,6 +2027,7 @@ func (app *App) playVideo(link string) {
 			} else {
 				app.videoDebugf("ffplay exited normally")
 			}
+			app.postEvent(event{src: "*", content: videoStopped{}})
 		}()
 		frameSize := videoWidth * videoHeight * 3
 		buffer := make([]byte, frameSize)
@@ -1658,7 +2035,6 @@ func (app *App) playVideo(link string) {
 		for {
 			if _, err := io.ReadFull(stdout, buffer); err != nil {
 				app.videoDebugf("video stream stopped after %d frames: %v", frameCount, err)
-				app.postEvent(event{src: "*", content: videoStopped{}})
 				return
 			}
 			frame := image.NewRGBA(image.Rect(0, 0, videoWidth, videoHeight))
@@ -1782,7 +2158,7 @@ func (app *App) maybeRequestHistory() {
 	}
 	netID, buffer := app.win.CurrentBuffer()
 	s := app.sessions[netID]
-	if s == nil || buffer == videoPlayerBuffer || buffer == debugBuffer {
+	if s == nil || buffer == videoPlayerBuffer || buffer == videoPlayerTextBuffer || buffer == debugBuffer || buffer == videoHistoryBuffer {
 		return
 	}
 	bk := boundKey{netID, s.Casemap(buffer)}

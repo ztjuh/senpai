@@ -95,6 +95,7 @@ type UI struct {
 
 	image      vaxis.Image
 	videoFrame *image.RGBA
+	videoFPS   float64
 
 	mouseLinks bool
 
@@ -507,13 +508,17 @@ func (ui *UI) AddLine(netID, buffer string, line Line) {
 	}
 }
 
-// AddLineVideoPlayer adds a line to the standalone video player buffer.
+// AddLineVideoPlayer adds text to the standalone video-player-text buffer.
 func (ui *UI) AddLineVideoPlayer(line Line) {
-	ui.bs.AddLine("", "video-player", line)
+	ui.bs.AddLine("", "video-player-text", line)
 }
 
 func (ui *UI) AddLineDebug(line Line) {
 	ui.bs.AddLine("", "debug", line)
+}
+
+func (ui *UI) AddLineVideoHistory(line Line) {
+	ui.bs.AddLine("", "history", line)
 }
 
 func (ui *UI) AddLines(netID, buffer string, before, after []Line) {
@@ -811,6 +816,10 @@ func (ui *UI) SetVideoFrame(frame *image.RGBA) {
 	ui.videoFrame = frame
 }
 
+func (ui *UI) SetVideoFPS(fps float64) {
+	ui.videoFPS = fps
+}
+
 func (ui *UI) VideoFrameSize() (int, int) {
 	width := ui.bs.tlInnerWidth
 	height := ui.bs.tlHeight * 2
@@ -902,16 +911,44 @@ func (ui *UI) drawVideoPlayer() {
 		return
 	}
 	frameBounds := frame.Bounds()
+	displayWidth := float64(width)
+	displayHeight := float64(height * 2)
+	sourceWidth := float64(frameBounds.Dx())
+	sourceHeight := float64(frameBounds.Dy())
+	scale := displayWidth / sourceWidth
+	if sourceHeight*scale > displayHeight {
+		scale = displayHeight / sourceHeight
+	}
+	renderWidth := sourceWidth * scale
+	renderHeight := sourceHeight * scale
+	offsetX := (displayWidth - renderWidth) / 2
+	offsetY := (displayHeight - renderHeight) / 2
+	sample := func(displayX, displayY int) (uint8, uint8, uint8) {
+		x := float64(displayX)
+		y := float64(displayY)
+		if x < offsetX || x >= offsetX+renderWidth || y < offsetY || y >= offsetY+renderHeight {
+			return 0, 0, 0
+		}
+		sourceX := int((x - offsetX) / scale)
+		sourceY := int((y - offsetY) / scale)
+		pixel := frame.RGBAAt(frameBounds.Min.X+sourceX, frameBounds.Min.Y+sourceY)
+		return pixel.R, pixel.G, pixel.B
+	}
 	for y := 0; y < height; y++ {
 		for x := 0; x < width; x++ {
-			upper := frame.RGBAAt(frameBounds.Min.X+x*frameBounds.Dx()/width, frameBounds.Min.Y+(y*2)*frameBounds.Dy()/(height*2))
-			lower := frame.RGBAAt(frameBounds.Min.X+x*frameBounds.Dx()/width, frameBounds.Min.Y+min((y*2+1)*frameBounds.Dy()/(height*2), frameBounds.Max.Y-1))
+			upperR, upperG, upperB := sample(x, y*2)
+			lowerR, lowerG, lowerB := sample(x, y*2+1)
 			setCell(ui.vx, x0+x, y0+y, '▀', vaxis.Style{
-				Foreground: vaxis.RGBColor(upper.R, upper.G, upper.B),
-				Background: vaxis.RGBColor(lower.R, lower.G, lower.B),
+				Foreground: vaxis.RGBColor(upperR, upperG, upperB),
+				Background: vaxis.RGBColor(lowerR, lowerG, lowerB),
 			})
 		}
 	}
+	printString(ui.vx, &x0, y0, Styled(fmt.Sprintf("FPS %.1f", ui.videoFPS), vaxis.Style{
+		Foreground: vaxis.ColorWhite,
+		Background: vaxis.ColorBlack,
+		Attribute:  vaxis.AttrBold,
+	}))
 }
 
 func (ui *UI) ScrollToBuffer() {

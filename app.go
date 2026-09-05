@@ -161,6 +161,7 @@ type App struct {
 
 	imageLoading bool
 	imageOverlay bool
+	videoPlaying bool
 	videoCancel  context.CancelFunc
 
 	uploadingProgress *float64
@@ -695,6 +696,7 @@ func (app *App) handleUIEvent(ev interface{}) bool {
 		}
 	case videoStopped:
 		app.imageOverlay = false
+		app.videoPlaying = false
 	case videoFrame:
 		app.win.SetVideoFrame(ev.frame)
 	case videoDebug:
@@ -780,7 +782,7 @@ func (app *App) handleMouseEvent(ev vaxis.Mouse) {
 	x, y := ev.Col, ev.Row
 	w, h := app.win.Size()
 
-	if app.imageOverlay && ev.Button == vaxis.MouseLeftButton {
+	if app.imageOverlay && !app.videoPlaying && ev.Button == vaxis.MouseLeftButton {
 		if ev.EventType == vaxis.EventPress {
 			app.stopVideo()
 			app.win.ShowImage(nil)
@@ -1450,6 +1452,7 @@ func (app *App) stopVideo() {
 		app.videoCancel()
 		app.videoCancel = nil
 	}
+	app.videoPlaying = false
 	app.win.SetVideoFrame(nil)
 }
 
@@ -1492,6 +1495,7 @@ func (app *App) playVideo(link string) {
 	})
 	app.videoDebugf("starting playback: %s", link)
 	app.imageOverlay = true
+	app.videoPlaying = true
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
 		app.videoDebugf("ffmpeg lookup failed: %v", err)
 		app.win.AddLineVideoPlayer(ui.Line{
@@ -1547,10 +1551,8 @@ func (app *App) playVideo(link string) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	app.videoCancel = cancel
-	const (
-		videoWidth  = 320
-		videoHeight = 180
-	)
+	videoWidth, videoHeight := app.win.VideoFrameSize()
+	app.videoDebugf("video frame size: %dx%d", videoWidth, videoHeight)
 	audioReader, audioWriter, err := os.Pipe()
 	if err != nil {
 		app.videoDebugf("audio pipe creation failed: %v", err)
@@ -1586,7 +1588,14 @@ func (app *App) playVideo(link string) {
 
 	ffmpegArgs := []string{"-loglevel", "error"}
 	for _, inputURL := range inputURLs {
-		ffmpegArgs = append(ffmpegArgs, "-re", "-i", inputURL)
+		ffmpegArgs = append(ffmpegArgs,
+			"-reconnect", "1",
+			"-reconnect_streamed", "1",
+			"-reconnect_on_network_error", "1",
+			"-reconnect_delay_max", "10",
+			"-rw_timeout", "15000000",
+			"-re", "-i", inputURL,
+		)
 	}
 	audioInput := 0
 	if len(inputURLs) > 1 {
@@ -1594,7 +1603,7 @@ func (app *App) playVideo(link string) {
 	}
 	ffmpegArgs = append(ffmpegArgs,
 		"-map", "0:v:0",
-		"-vf", "fps=15,scale=320:180:force_original_aspect_ratio=decrease,pad=320:180:(ow-iw)/2:(oh-ih)/2",
+		"-vf", fmt.Sprintf("fps=30,scale=%d:%d:force_original_aspect_ratio=decrease:flags=lanczos,pad=%d:%d:(ow-iw)/2:(oh-ih)/2", videoWidth, videoHeight, videoWidth, videoHeight),
 		"-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
 		"-map", fmt.Sprintf("%d:a:0?", audioInput), "-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:3")
 	cmd := exec.CommandContext(ctx, "ffmpeg", ffmpegArgs...)

@@ -811,6 +811,24 @@ func (ui *UI) SetVideoFrame(frame *image.RGBA) {
 	ui.videoFrame = frame
 }
 
+func (ui *UI) VideoFrameSize() (int, int) {
+	width := ui.bs.tlInnerWidth
+	height := ui.bs.tlHeight * 2
+	if width > 1280 {
+		width = 1280
+	}
+	if height > 720 {
+		height = 720
+	}
+	if width < 2 {
+		width = 2
+	}
+	if height < 2 {
+		height = 2
+	}
+	return width, height
+}
+
 func (ui *UI) AsyncCompletions(id int, cs []Completion) {
 	ui.e.AsyncCompletions(id, cs)
 }
